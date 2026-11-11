@@ -1,0 +1,1105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ASTEROIDS · CRT EDITION</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#020204; overflow:hidden; }
+  #stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+           background:radial-gradient(ellipse at center, #0a0a14 0%, #000 78%); }
+  #frame { position:relative; }
+  canvas { display:block; }
+  #game { display:none; }
+  #crt { border-radius:14px; background:#000;
+         box-shadow:0 0 90px rgba(90,255,255,.10), 0 0 22px rgba(0,0,0,.9); }
+  /* WebGL 不可用时的降级扫描线覆盖层 */
+  #scan { position:absolute; inset:0; pointer-events:none; display:none; border-radius:14px;
+          background:repeating-linear-gradient(0deg, rgba(0,0,0,.28) 0px, rgba(0,0,0,.28) 1px, transparent 1px, transparent 3px);
+          box-shadow:inset 0 0 140px rgba(0,0,0,.85); }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="frame">
+    <canvas id="game" width="1024" height="768"></canvas>
+    <canvas id="crt"></canvas>
+    <div id="scan"></div>
+  </div>
+</div>
+<script>
+'use strict';
+/* ============================================================
+ * ASTEROIDS · CRT EDITION
+ * Canvas 2D 渲染游戏画面 → WebGL CRT 着色器后期处理
+ * ============================================================ */
+
+/* ---------------- 常量 ---------------- */
+const W = 1024, H = 768;
+const TAU = Math.PI * 2;
+const SHIP_R = 12;
+const ROT_SPEED = 4.6;          // 旋转速度 rad/s
+const THRUST = 340;             // 推进加速度 px/s^2
+const MAX_SPEED = 500;
+const BULLET_SPEED = 560;
+const BULLET_LIFE = 0.9;
+const MAX_BULLETS = 6;
+const FIRE_CD = 0.16;
+// 六级小行星：半径 / 得分（越小分越高）
+const AST_RADII = [9, 14, 22, 34, 52, 78];
+const AST_SCORE = [200, 120, 90, 60, 40, 20];
+const MAX_ASTEROIDS = 64;
+// 引力井
+const GRAV_RADIUS = 270;        // 吸引半径
+const GRAV_BLAST = 200;         // 引爆半径
+const GRAV_LIFE = 4.5;          // 存在时间（秒）
+const GRAV_PULL = 720;          // 中心最大拉力
+const GRAV_SWIRL = 0.55;        // 切向漩涡比例
+const GRAV_SHIP_PULL = 0.35;    // 对飞船的拉力比例
+const MAX_GRAV_CHARGES = 3;
+const EXTRA_LIFE_EVERY = 10000;
+const LS_KEY = 'asteroids-crt-hiscores-v1';
+
+/* ---------------- 工具 ---------------- */
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+// 环绕世界下的最短位移
+function wdelta(d, size) { if (d > size / 2) return d - size; if (d < -size / 2) return d + size; return d; }
+function wrapObj(o, r) {
+  if (o.x < -r) o.x = W + r; else if (o.x > W + r) o.x = -r;
+  if (o.y < -r) o.y = H + r; else if (o.y > H + r) o.y = -r;
+}
+
+/* ---------------- DOM ---------------- */
+const gameCanvas = document.getElementById('game');
+const crtCanvas = document.getElementById('crt');
+const scanDiv = document.getElementById('scan');
+const ctx = gameCanvas.getContext('2d');
+
+/* ---------------- 音效（WebAudio 合成） ---------------- */
+const SFX = {
+  ctx: null, master: null, noiseBuf: null, muted: false,
+  thrustSrc: null, thrustGain: null,
+  ensure() {
+    if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    this.ctx = new AC();
+    this.master = this.ctx.createGain();
+    this.master.gain.value = this.muted ? 0 : 0.5;
+    this.master.connect(this.ctx.destination);
+    const len = this.ctx.sampleRate;
+    this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const d = this.noiseBuf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  },
+  tone(freq, dur, opt) {
+    if (!this.ctx || this.muted) return;
+    const o = opt || {};
+    const t0 = this.ctx.currentTime + (o.delay || 0);
+    const osc = this.ctx.createOscillator(), g = this.ctx.createGain();
+    osc.type = o.type || 'square';
+    osc.frequency.setValueAtTime(freq, t0);
+    if (o.slide) osc.frequency.exponentialRampToValueAtTime(Math.max(o.slide, 1), t0 + dur);
+    g.gain.setValueAtTime(o.vol || 0.15, t0);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    osc.connect(g); g.connect(this.master);
+    osc.start(t0); osc.stop(t0 + dur + 0.03);
+  },
+  noiseHit(dur, vol, freq) {
+    if (!this.ctx || this.muted) return;
+    const t0 = this.ctx.currentTime;
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.noiseBuf; src.loop = true;
+    const f = this.ctx.createBiquadFilter();
+    f.type = 'lowpass'; f.frequency.value = freq;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(vol, t0);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    src.connect(f); f.connect(g); g.connect(this.master);
+    src.start(t0); src.stop(t0 + dur + 0.03);
+  },
+  shoot()      { this.tone(900, 0.12, { type: 'square', vol: 0.10, slide: 240 }); },
+  explosion(size) { this.noiseHit(0.25 + size * 0.07, 0.22, 300 + size * 160); },
+  shipExplode(){ this.noiseHit(0.8, 0.35, 320); this.tone(150, 0.6, { type: 'sawtooth', vol: 0.18, slide: 40 }); },
+  pickup()     { this.tone(660, 0.08, { vol: 0.14 }); this.tone(880, 0.09, { vol: 0.14, delay: 0.08 }); this.tone(1320, 0.14, { vol: 0.14, delay: 0.16 }); },
+  wellDeploy() { this.tone(180, 0.55, { type: 'sine', vol: 0.25, slide: 780 }); },
+  detonate()   { this.noiseHit(0.9, 0.45, 220); this.tone(80, 0.7, { type: 'sine', vol: 0.35, slide: 28 }); },
+  extraLife()  { this.tone(523, 0.1, { vol: 0.15 }); this.tone(659, 0.1, { vol: 0.15, delay: 0.1 }); this.tone(784, 0.1, { vol: 0.15, delay: 0.2 }); this.tone(1047, 0.22, { vol: 0.15, delay: 0.3 }); },
+  setThrust(on) {
+    if (!this.ctx) return;
+    if (on && !this.thrustSrc) {
+      this.thrustSrc = this.ctx.createBufferSource();
+      this.thrustSrc.buffer = this.noiseBuf; this.thrustSrc.loop = true;
+      const f = this.ctx.createBiquadFilter();
+      f.type = 'lowpass'; f.frequency.value = 500;
+      this.thrustGain = this.ctx.createGain();
+      this.thrustGain.gain.value = 0;
+      this.thrustSrc.connect(f); f.connect(this.thrustGain); this.thrustGain.connect(this.master);
+      this.thrustSrc.start();
+    }
+    if (this.thrustGain)
+      this.thrustGain.gain.setTargetAtTime(on && !this.muted ? 0.09 : 0, this.ctx.currentTime, 0.05);
+  }
+};
+
+/* ---------------- 输入 ---------------- */
+const keys = {};
+window.addEventListener('keydown', e => {
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+  SFX.ensure();
+  if (e.repeat) { keys[e.code] = true; return; }
+  keys[e.code] = true;
+  onKey(e);
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+window.addEventListener('blur', () => {
+  if (G.state === 'playing') { G.paused = true; SFX.setThrust(false); }
+});
+
+function onKey(e) {
+  const c = e.code;
+  if (c === 'KeyM') {
+    SFX.muted = !SFX.muted;
+    if (SFX.master) SFX.master.gain.value = SFX.muted ? 0 : 0.5;
+    G.banner = { text: SFX.muted ? 'SOUND OFF' : 'SOUND ON', t: 1 };
+    return;
+  }
+  if (G.state === 'title') {
+    if (c === 'Enter' || c === 'NumpadEnter' || c === 'Space') startGame();
+    return;
+  }
+  if (G.state === 'playing') {
+    if (c === 'KeyP') { G.paused = !G.paused; if (G.paused) SFX.setThrust(false); return; }
+    if (G.paused) return;
+    if (c === 'KeyE' || c === 'ShiftLeft' || c === 'ShiftRight') deployWell();
+    return;
+  }
+  if (G.state === 'gameover') {
+    if (c === 'Enter' || c === 'NumpadEnter') G.state = 'title';
+    return;
+  }
+  if (G.state === 'initials') {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    const arr = G.initials.split('');
+    if (c === 'ArrowUp')        arr[G.initPos] = chars[(chars.indexOf(arr[G.initPos]) + 1) % chars.length];
+    else if (c === 'ArrowDown') arr[G.initPos] = chars[(chars.indexOf(arr[G.initPos]) + chars.length - 1) % chars.length];
+    else if (c === 'ArrowLeft' || c === 'Backspace') G.initPos = (G.initPos + 2) % 3;
+    else if (c === 'ArrowRight') G.initPos = (G.initPos + 1) % 3;
+    else if (c === 'Enter' || c === 'NumpadEnter') { saveScore(); G.state = 'gameover'; return; }
+    else if (e.key && e.key.length === 1 && /[a-z0-9]/i.test(e.key)) {
+      arr[G.initPos] = e.key.toUpperCase();
+      G.initPos = Math.min(G.initPos + 1, 2);
+    }
+    G.initials = arr.join('');
+  }
+}
+
+/* ---------------- 游戏状态 ---------------- */
+const G = {
+  state: 'title',          // title | playing | initials | gameover
+  paused: false,
+  time: 0,
+  score: 0, lives: 3, wave: 0,
+  gravCharges: 1,
+  fireCd: 0, respawnT: 0, waveT: 0, gameOverT: 0, powerupT: 16,
+  shake: 0, flash: 0,
+  nextExtra: EXTRA_LIFE_EVERY,
+  hiscores: [], newHigh: -1,
+  initials: 'AAA', initPos: 0,
+  banner: null
+};
+
+const ship = { x: W / 2, y: H / 2, vx: 0, vy: 0, angle: -Math.PI / 2, alive: false, invuln: 0, thrustVis: false };
+let asteroids = [];
+let bullets = [];
+let particles = [];
+let wells = [];
+let powerups = [];
+
+/* 星空背景 */
+const stars = [];
+for (let i = 0; i < 140; i++)
+  stars.push({ x: Math.random() * W, y: Math.random() * H, r: Math.random() < 0.8 ? 1 : 2, ph: Math.random() * TAU, sp: 0.5 + Math.random() * 2 });
+
+/* ---------------- 最高分 ---------------- */
+function loadScores() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr) && arr.length)
+        return arr.filter(o => o && typeof o.score === 'number' && typeof o.name === 'string').slice(0, 10);
+    }
+  } catch (e) {}
+  return [
+    { name: 'CRT', score: 15000 }, { name: 'VEC', score: 12000 }, { name: 'NEO', score: 10000 },
+    { name: 'ACE', score: 8000 },  { name: 'ROB', score: 6000 },  { name: 'MAX', score: 4000 },
+    { name: 'JAZ', score: 3000 },  { name: 'UFO', score: 2000 }
+  ];
+}
+function qualifies() {
+  return G.score > 0 && (G.hiscores.length < 10 || G.score > G.hiscores[G.hiscores.length - 1].score);
+}
+function saveScore() {
+  G.hiscores.push({ name: G.initials, score: G.score });
+  G.hiscores.sort((a, b) => b.score - a.score);
+  G.hiscores = G.hiscores.slice(0, 10);
+  G.newHigh = G.hiscores.findIndex(o => o.name === G.initials && o.score === G.score);
+  try { localStorage.setItem(LS_KEY, JSON.stringify(G.hiscores)); } catch (e) {}
+}
+
+/* ---------------- 生成 ---------------- */
+function spawnAsteroid(x, y, size, vx, vy) {
+  const n = 9 + ((Math.random() * 4) | 0);
+  const verts = [];
+  for (let i = 0; i < n; i++)
+    verts.push([i / n * TAU + (Math.random() - 0.5) * 0.3, 0.75 + Math.random() * 0.4]);
+  asteroids.push({ x, y, vx, vy, size, r: AST_RADII[size], angle: Math.random() * TAU, spin: (Math.random() - 0.5) * 2.2, verts });
+}
+
+function spawnWave(n) {
+  const count = Math.min(2 + n, 9);
+  const cx = ship.alive ? ship.x : W / 2, cy = ship.alive ? ship.y : H / 2;
+  for (let i = 0; i < count && asteroids.length < MAX_ASTEROIDS; i++) {
+    let x, y, tries = 0;
+    do {
+      const side = (Math.random() * 4) | 0;
+      if (side === 0)      { x = Math.random() * W; y = -AST_RADII[5]; }
+      else if (side === 1) { x = Math.random() * W; y = H + AST_RADII[5]; }
+      else if (side === 2) { x = -AST_RADII[5]; y = Math.random() * H; }
+      else                 { x = W + AST_RADII[5]; y = Math.random() * H; }
+      tries++;
+    } while (Math.hypot(x - cx, y - cy) < 300 && tries < 10);
+    const size = Math.random() < 0.7 ? 5 : 4;
+    const ang = Math.random() * TAU;
+    const spd = 26 + n * 4 + Math.random() * 26;
+    spawnAsteroid(x, y, size, Math.cos(ang) * spd, Math.sin(ang) * spd);
+  }
+}
+
+function spawnAmbientAsteroid() {
+  const side = (Math.random() * 4) | 0;
+  let x, y;
+  if (side === 0)      { x = Math.random() * W; y = -60; }
+  else if (side === 1) { x = Math.random() * W; y = H + 60; }
+  else if (side === 2) { x = -60; y = Math.random() * H; }
+  else                 { x = W + 60; y = Math.random() * H; }
+  const ang = Math.random() * TAU, sp = 20 + Math.random() * 40;
+  spawnAsteroid(x, y, 3 + ((Math.random() * 3) | 0), Math.cos(ang) * sp, Math.sin(ang) * sp);
+}
+
+function spawnPowerupAt(x, y) {
+  powerups.push({ x, y, vx: (Math.random() - 0.5) * 40, vy: (Math.random() - 0.5) * 40, t: 12 });
+}
+function spawnPowerup() {
+  const side = (Math.random() * 4) | 0;
+  let x, y;
+  if (side === 0)      { x = Math.random() * W; y = -20; }
+  else if (side === 1) { x = Math.random() * W; y = H + 20; }
+  else if (side === 2) { x = -20; y = Math.random() * H; }
+  else                 { x = W + 20; y = Math.random() * H; }
+  const ang = Math.atan2(H / 2 - y, W / 2 - x) + (Math.random() - 0.5);
+  powerups.push({ x, y, vx: Math.cos(ang) * 35, vy: Math.sin(ang) * 35, t: 12 });
+}
+
+/* ---------------- 游戏逻辑 ---------------- */
+function startGame() {
+  SFX.ensure();
+  asteroids = []; bullets = []; particles = []; wells = []; powerups = [];
+  G.score = 0; G.lives = 3; G.wave = 0; G.gravCharges = 1;
+  G.fireCd = 0; G.respawnT = 0; G.waveT = 0; G.gameOverT = 0; G.powerupT = 16;
+  G.shake = 0; G.flash = 0; G.banner = null; G.paused = false;
+  G.nextExtra = EXTRA_LIFE_EVERY; G.newHigh = -1;
+  resetShip();
+  G.state = 'playing';
+}
+
+function resetShip() {
+  Object.assign(ship, { x: W / 2, y: H / 2, vx: 0, vy: 0, angle: -Math.PI / 2, alive: true, invuln: 3, thrustVis: false });
+}
+
+function addScore(n) {
+  G.score += n;
+  if (G.score >= G.nextExtra) {
+    G.nextExtra += EXTRA_LIFE_EVERY;
+    G.lives++;
+    SFX.extraLife();
+    addText('EXTRA LIFE', ship.alive ? ship.x : W / 2, (ship.alive ? ship.y : H / 2) - 40, '#7dff8a');
+  }
+}
+
+function addText(text, x, y, color) {
+  particles.push({ type: 'text', text, x, y, vx: 0, vy: -40, life: 1.4, maxLife: 1.4, color: color || '#ffd166' });
+}
+
+function explode(x, y, r) {
+  const n = Math.min(8 + Math.round(r * 0.45), 36);
+  for (let i = 0; i < n && particles.length < 700; i++) {
+    const ang = Math.random() * TAU, sp = 40 + Math.random() * (60 + r * 2.2);
+    particles.push({
+      type: 'spark', x, y,
+      vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp,
+      life: 0.35 + Math.random() * 0.45, maxLife: 0.8,
+      color: Math.random() < 0.7 ? '#bfe9ff' : '#ffffff', drag: 0.92
+    });
+  }
+}
+
+function killAsteroid(a, award) {
+  if (award !== false) addScore(AST_SCORE[a.size]);
+  explode(a.x, a.y, a.r);
+  SFX.explosion(a.size);
+  G.shake = Math.min(G.shake + a.r * 0.06, 10);
+  // 分裂为下一级碎块
+  if (a.size > 0 && asteroids.length < MAX_ASTEROIDS) {
+    for (let i = 0; i < 2; i++) {
+      const ang = Math.random() * TAU;
+      const sp = (46 + (5 - a.size) * 20) * (0.7 + Math.random() * 0.6);
+      spawnAsteroid(a.x, a.y, a.size - 1, Math.cos(ang) * sp + a.vx * 0.4, Math.sin(ang) * sp + a.vy * 0.4);
+    }
+  }
+  // 大行星概率掉落引力井道具
+  if (a.size >= 3 && powerups.length === 0 && Math.random() < 0.10) spawnPowerupAt(a.x, a.y);
+}
+
+function killShip() {
+  if (!ship.alive) return;
+  ship.alive = false;
+  SFX.setThrust(false);
+  SFX.shipExplode();
+  G.shake = Math.min(G.shake + 12, 24);
+  explode(ship.x, ship.y, 30);
+  // 飞船碎片（线段飞散）
+  for (let i = 0; i < 5; i++) {
+    particles.push({
+      type: 'debris', x: ship.x, y: ship.y,
+      vx: (Math.random() - 0.5) * 320, vy: (Math.random() - 0.5) * 320,
+      angle: Math.random() * TAU, spin: (Math.random() - 0.5) * 16,
+      len: 8 + Math.random() * 10, life: 1.2, maxLife: 1.2, color: '#7df9ff'
+    });
+  }
+  G.lives--;
+  if (G.lives <= 0) G.gameOverT = 2.2;
+  else G.respawnT = 2.0;
+}
+
+function doGameOver() {
+  SFX.setThrust(false);
+  wells = []; powerups = []; bullets = [];
+  if (qualifies()) { G.state = 'initials'; G.initials = 'AAA'; G.initPos = 0; }
+  else G.state = 'gameover';
+}
+
+function deployWell() {
+  if (!ship.alive || G.gravCharges <= 0) return;
+  G.gravCharges--;
+  wells.push({ x: ship.x, y: ship.y, vx: ship.vx * 0.25, vy: ship.vy * 0.25, t: GRAV_LIFE });
+  SFX.wellDeploy();
+  particles.push({ type: 'ring', x: ship.x, y: ship.y, vx: 0, vy: 0, r: 8, vr: GRAV_RADIUS * 1.6, life: 0.5, maxLife: 0.5, color: '#b78cff', width: 6 });
+}
+
+function detonate(w) {
+  G.shake = Math.min(G.shake + 16, 26);
+  G.flash = 0.5;
+  SFX.detonate();
+  particles.push({ type: 'ring', x: w.x, y: w.y, vx: 0, vy: 0, r: 20, vr: GRAV_BLAST * 2.2, life: 0.55, maxLife: 0.55, color: '#d9b3ff', width: 10 });
+  particles.push({ type: 'ring', x: w.x, y: w.y, vx: 0, vy: 0, r: 10, vr: GRAV_BLAST * 3.2, life: 0.4, maxLife: 0.4, color: '#ffffff', width: 5 });
+  for (let i = 0; i < 40 && particles.length < 700; i++) {
+    const ang = Math.random() * TAU, sp = 100 + Math.random() * 300;
+    particles.push({
+      type: 'spark', x: w.x, y: w.y,
+      vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp,
+      life: 0.4 + Math.random() * 0.5, maxLife: 0.9,
+      color: Math.random() < 0.6 ? '#c77dff' : '#ffffff', drag: 0.94
+    });
+  }
+  // 引爆半径内的小行星全部击碎（计分）
+  const victims = asteroids.filter(a => {
+    const dx = wdelta(a.x - w.x, W), dy = wdelta(a.y - w.y, H);
+    return Math.hypot(dx, dy) < GRAV_BLAST + a.r;
+  });
+  if (victims.length) {
+    asteroids = asteroids.filter(a => !victims.includes(a));
+    victims.forEach(a => killAsteroid(a));
+  }
+}
+
+function areaClear(x, y, r) {
+  for (const a of asteroids)
+    if (Math.hypot(a.x - x, a.y - y) < r + a.r) return false;
+  return true;
+}
+
+/* ---------------- 更新 ---------------- */
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life -= dt;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    if (p.drag) { const f = Math.pow(p.drag, dt * 60); p.vx *= f; p.vy *= f; }
+    if (p.type === 'ring') p.r += p.vr * dt;
+    if (p.type === 'debris') p.angle += p.spin * dt;
+  }
+}
+
+function updateAsteroids(dt) {
+  for (const a of asteroids) {
+    a.x += a.vx * dt; a.y += a.vy * dt;
+    a.angle += a.spin * dt;
+    wrapObj(a, a.r);
+  }
+}
+
+function updateWells(dt) {
+  for (let wi = wells.length - 1; wi >= 0; wi--) {
+    const w = wells[wi];
+    w.t -= dt;
+    w.x += w.vx * dt; w.y += w.vy * dt;
+    wrapObj(w, 10);
+    const urgent = w.t < 1.2;
+    const pull = GRAV_PULL * (urgent ? 1.5 : 1);
+    // 吸引小行星（径向 + 切向漩涡）
+    const crush = [];
+    for (const a of asteroids) {
+      const dx = wdelta(w.x - a.x, W), dy = wdelta(w.y - a.y, H);
+      const d = Math.hypot(dx, dy);
+      if (d < GRAV_RADIUS) {
+        if (d < 26 + a.r * 0.4) { crush.push(a); continue; }  // 坠入奇点直接粉碎
+        const nx = dx / d, ny = dy / d;
+        const f = pull * (1 - d / GRAV_RADIUS);
+        a.vx += (nx * f - ny * f * GRAV_SWIRL) * dt;
+        a.vy += (ny * f + nx * f * GRAV_SWIRL) * dt;
+      }
+    }
+    if (crush.length) {
+      asteroids = asteroids.filter(a => !crush.includes(a));
+      crush.forEach(a => killAsteroid(a));
+    }
+    // 轻微牵引飞船（可被推进器挣脱）
+    if (ship.alive) {
+      const dx = wdelta(w.x - ship.x, W), dy = wdelta(w.y - ship.y, H);
+      const d = Math.hypot(dx, dy);
+      if (d < GRAV_RADIUS && d > 1) {
+        const f = pull * GRAV_SHIP_PULL * (1 - d / GRAV_RADIUS);
+        ship.vx += dx / d * f * dt;
+        ship.vy += dy / d * f * dt;
+      }
+    }
+    // 引力场漩涡粒子
+    for (let i = 0; i < 2 && particles.length < 620; i++) {
+      const ang = Math.random() * TAU;
+      const r = GRAV_RADIUS * (0.55 + Math.random() * 0.45);
+      const sp = 140 + Math.random() * 80;
+      particles.push({
+        type: 'dot',
+        x: w.x + Math.cos(ang) * r, y: w.y + Math.sin(ang) * r,
+        vx: -Math.sin(ang) * sp - Math.cos(ang) * 50,
+        vy:  Math.cos(ang) * sp - Math.sin(ang) * 50,
+        life: 0.5 + Math.random() * 0.4, maxLife: 0.9,
+        color: Math.random() < 0.5 ? '#b78cff' : '#7de8ff',
+        size: 1.8 + Math.random() * 1.4, drag: 0.98
+      });
+    }
+    if (w.t <= 0) { wells.splice(wi, 1); detonate(w); }
+  }
+}
+
+function updatePowerups(dt) {
+  for (let i = powerups.length - 1; i >= 0; i--) {
+    const p = powerups[i];
+    p.t -= dt;
+    if (p.t <= 0) { powerups.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    wrapObj(p, 16);
+  }
+}
+
+function collide() {
+  // 子弹 vs 小行星
+  for (let bi = bullets.length - 1; bi >= 0; bi--) {
+    const b = bullets[bi];
+    for (let ai = asteroids.length - 1; ai >= 0; ai--) {
+      const a = asteroids[ai];
+      const dx = a.x - b.x, dy = a.y - b.y;
+      const rr = a.r * 0.92;
+      if (dx * dx + dy * dy < rr * rr) {
+        bullets.splice(bi, 1);
+        asteroids.splice(ai, 1);
+        killAsteroid(a);
+        break;
+      }
+    }
+  }
+  // 飞船 vs 小行星
+  if (ship.alive && ship.invuln <= 0) {
+    for (const a of asteroids) {
+      const dx = a.x - ship.x, dy = a.y - ship.y;
+      const rr = a.r * 0.9 + SHIP_R;
+      if (dx * dx + dy * dy < rr * rr) { killShip(); break; }
+    }
+  }
+  // 飞船 vs 道具
+  if (ship.alive) {
+    for (let i = powerups.length - 1; i >= 0; i--) {
+      const p = powerups[i];
+      const dx = p.x - ship.x, dy = p.y - ship.y;
+      if (dx * dx + dy * dy < 30 * 30) {
+        powerups.splice(i, 1);
+        G.gravCharges = Math.min(MAX_GRAV_CHARGES, G.gravCharges + 1);
+        addText('+1 GRAVITY WELL', ship.x, ship.y - 30, '#c77dff');
+        SFX.pickup();
+      }
+    }
+  }
+}
+
+function updatePlaying(dt) {
+  if (G.fireCd > 0) G.fireCd -= dt;
+
+  // 飞船控制
+  if (ship.alive) {
+    if (keys['ArrowLeft'] || keys['KeyA']) ship.angle -= ROT_SPEED * dt;
+    if (keys['ArrowRight'] || keys['KeyD']) ship.angle += ROT_SPEED * dt;
+    const th = keys['ArrowUp'] || keys['KeyW'];
+    ship.thrustVis = false;
+    if (th) {
+      ship.vx += Math.cos(ship.angle) * THRUST * dt;
+      ship.vy += Math.sin(ship.angle) * THRUST * dt;
+      ship.thrustVis = true;
+      if (particles.length < 650) {
+        const bx = ship.x - Math.cos(ship.angle) * 12, by = ship.y - Math.sin(ship.angle) * 12;
+        particles.push({
+          type: 'dot', x: bx, y: by,
+          vx: -Math.cos(ship.angle) * 130 + (Math.random() - 0.5) * 60,
+          vy: -Math.sin(ship.angle) * 130 + (Math.random() - 0.5) * 60,
+          life: 0.28, maxLife: 0.28, color: '#ffb347', size: 2.2, drag: 0.9
+        });
+      }
+    }
+    const f = Math.pow(0.99, dt * 60);
+    ship.vx *= f; ship.vy *= f;
+    const sp = Math.hypot(ship.vx, ship.vy);
+    if (sp > MAX_SPEED) { ship.vx *= MAX_SPEED / sp; ship.vy *= MAX_SPEED / sp; }
+    ship.x += ship.vx * dt; ship.y += ship.vy * dt;
+    wrapObj(ship, SHIP_R);
+    if (ship.invuln > 0) ship.invuln -= dt;
+    // 开火
+    if (keys['Space'] && G.fireCd <= 0 && bullets.length < MAX_BULLETS) {
+      const ca = Math.cos(ship.angle), sa = Math.sin(ship.angle);
+      bullets.push({ x: ship.x + ca * 16, y: ship.y + sa * 16, vx: ship.vx + ca * BULLET_SPEED, vy: ship.vy + sa * BULLET_SPEED, life: BULLET_LIFE });
+      G.fireCd = FIRE_CD;
+      SFX.shoot();
+    }
+    SFX.setThrust(!!th);
+  } else {
+    SFX.setThrust(false);
+  }
+
+  // 子弹
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.life -= dt;
+    if (b.life <= 0) { bullets.splice(i, 1); continue; }
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    wrapObj(b, 4);
+  }
+
+  updateAsteroids(dt);
+  updateWells(dt);
+  updatePowerups(dt);
+  collide();
+
+  // 波次推进
+  if (asteroids.length === 0 && G.waveT <= 0 && G.gameOverT <= 0) {
+    G.wave++;
+    G.waveT = 2.2;
+    G.banner = { text: G.wave === 1 ? 'GET READY!' : 'WAVE ' + G.wave, t: 2.2 };
+  }
+  if (G.waveT > 0) {
+    G.waveT -= dt;
+    if (G.waveT <= 0) spawnWave(G.wave);
+  }
+
+  // 重生
+  if (!ship.alive && G.lives > 0 && G.gameOverT <= 0) {
+    G.respawnT -= dt;
+    if (G.respawnT <= 0) {
+      if (areaClear(W / 2, H / 2, 170)) resetShip();
+      else G.respawnT = 0.5;
+    }
+  }
+
+  // 游戏结束倒计时
+  if (G.gameOverT > 0) {
+    G.gameOverT -= dt;
+    if (G.gameOverT <= 0) doGameOver();
+  }
+
+  // 定时生成引力井道具
+  G.powerupT -= dt;
+  if (G.powerupT <= 0) {
+    G.powerupT = 20 + Math.random() * 10;
+    if (powerups.length === 0 && G.gravCharges < MAX_GRAV_CHARGES) spawnPowerup();
+  }
+}
+
+/* ---------------- 渲染 ---------------- */
+function drawText(txt, x, y, size, color, align, glow) {
+  ctx.font = 'bold ' + size + 'px "Courier New", monospace';
+  ctx.textAlign = align || 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = color;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = glow === undefined ? 14 : glow;
+  ctx.fillText(txt, x, y);
+  ctx.shadowBlur = 0;
+}
+
+function shipPath() {
+  ctx.beginPath();
+  ctx.moveTo(15, 0); ctx.lineTo(-11, 10); ctx.lineTo(-6, 0); ctx.lineTo(-11, -10);
+  ctx.closePath();
+}
+
+function drawStars() {
+  ctx.fillStyle = '#9fd8e8';
+  for (const s of stars) {
+    ctx.globalAlpha = 0.15 + 0.3 * (0.5 + 0.5 * Math.sin(G.time * s.sp + s.ph));
+    ctx.fillRect(s.x, s.y, s.r, s.r);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawAsteroid(a) {
+  ctx.save();
+  ctx.translate(a.x, a.y);
+  ctx.beginPath();
+  const n = a.verts.length;
+  for (let i = 0; i < n; i++) {
+    const ang = a.angle + a.verts[i][0];
+    const r = a.r * a.verts[i][1];
+    const px = Math.cos(ang) * r, py = Math.sin(ang) * r;
+    if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py);
+  }
+  ctx.closePath();
+  ctx.strokeStyle = '#bfe9ff';
+  ctx.globalAlpha = 0.16; ctx.lineWidth = 6; ctx.stroke();   // 光晕层
+  ctx.globalAlpha = 1;    ctx.lineWidth = 1.8; ctx.stroke(); // 实体层
+  ctx.restore();
+}
+
+function drawShip() {
+  ctx.save();
+  ctx.translate(ship.x, ship.y);
+  ctx.rotate(ship.angle);
+  ctx.strokeStyle = '#5fffff';
+  shipPath();
+  ctx.globalAlpha = 0.2; ctx.lineWidth = 5; ctx.stroke();
+  ctx.globalAlpha = 1;   ctx.lineWidth = 2; ctx.stroke();
+  if (ship.thrustVis && Math.random() > 0.3) {
+    ctx.strokeStyle = '#ffb347';
+    ctx.beginPath();
+    ctx.moveTo(-7, 5); ctx.lineTo(-15 - Math.random() * 8, 0); ctx.lineTo(-7, -5);
+    ctx.globalAlpha = 0.25; ctx.lineWidth = 5; ctx.stroke();
+    ctx.globalAlpha = 1;    ctx.lineWidth = 2; ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawBullets() {
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (const b of bullets) {
+    ctx.globalAlpha = 0.35; ctx.fillStyle = '#eaffff';
+    ctx.beginPath(); ctx.arc(b.x, b.y, 5, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.arc(b.x, b.y, 2.2, 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+function drawWell(w) {
+  const t = G.time;
+  const urgent = w.t < 1.2;
+  ctx.save();
+  ctx.translate(w.x, w.y);
+  // 影响范围虚线环（旋转）
+  ctx.globalAlpha = 0.28;
+  ctx.strokeStyle = '#9a6bff';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([14, 20]);
+  ctx.lineDashOffset = -t * 50;
+  ctx.beginPath(); ctx.arc(0, 0, GRAV_RADIUS, 0, TAU); ctx.stroke();
+  ctx.setLineDash([]);
+  // 向心收缩环（表现"吸入"）
+  for (let i = 0; i < 3; i++) {
+    const f = (t * 0.6 + i / 3) % 1;
+    const r = GRAV_RADIUS * (1 - f);
+    ctx.globalAlpha = 0.35 * f;
+    ctx.strokeStyle = '#b78cff';
+    ctx.beginPath(); ctx.arc(0, 0, Math.max(r, 2), 0, TAU); ctx.stroke();
+  }
+  // 核心光晕
+  const pulse = 1 + 0.2 * Math.sin(t * (urgent ? 25 : 8));
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 60 * pulse);
+  g.addColorStop(0, 'rgba(230,210,255,0.9)');
+  g.addColorStop(0.25, 'rgba(170,110,255,0.5)');
+  g.addColorStop(1, 'rgba(120,60,255,0)');
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(0, 0, 60 * pulse, 0, TAU); ctx.fill();
+  // 奇点
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(0, 0, 3.5 * pulse, 0, TAU); ctx.fill();
+  // 引爆预警圈
+  if (urgent && Math.sin(t * 30) > 0) {
+    ctx.globalAlpha = 0.5;
+    ctx.strokeStyle = '#ffb14e';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0, 0, GRAV_BLAST, 0, TAU); ctx.stroke();
+  }
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+function drawPowerup(p) {
+  const blinkA = p.t < 3 ? (Math.sin(G.time * 16) > 0 ? 1 : 0.25) : 1;
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.globalAlpha = blinkA;
+  const pulse = 1 + 0.12 * Math.sin(G.time * 5);
+  ctx.strokeStyle = '#c77dff';
+  ctx.globalAlpha = blinkA * 0.25; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.arc(0, 0, 13 * pulse, 0, TAU); ctx.stroke();
+  ctx.globalAlpha = blinkA; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(0, 0, 13 * pulse, 0, TAU); ctx.stroke();
+  // 环绕小点
+  ctx.fillStyle = '#e0b3ff';
+  for (let i = 0; i < 3; i++) {
+    const ang = G.time * 2.5 + i * TAU / 3;
+    ctx.beginPath(); ctx.arc(Math.cos(ang) * 21, Math.sin(ang) * 21, 2, 0, TAU); ctx.fill();
+  }
+  drawText('G', 0, 1, 14, '#ffffff', 'center', 8);
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+function drawParticles() {
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (const p of particles) {
+    const a = Math.max(p.life / p.maxLife, 0);
+    if (p.type === 'dot') {
+      ctx.globalAlpha = a; ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, TAU); ctx.fill();
+    } else if (p.type === 'spark') {
+      ctx.globalAlpha = a; ctx.strokeStyle = p.color; ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - p.vx * 0.03, p.y - p.vy * 0.03); ctx.stroke();
+    } else if (p.type === 'ring') {
+      ctx.globalAlpha = a * 0.8; ctx.strokeStyle = p.color; ctx.lineWidth = 1 + p.width * a;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.stroke();
+    } else if (p.type === 'debris') {
+      ctx.globalAlpha = a; ctx.strokeStyle = p.color; ctx.lineWidth = 1.6;
+      const c = Math.cos(p.angle) * p.len / 2, s = Math.sin(p.angle) * p.len / 2;
+      ctx.beginPath(); ctx.moveTo(p.x - c, p.y - s); ctx.lineTo(p.x + c, p.y + s); ctx.stroke();
+    }
+  }
+  ctx.restore();
+  ctx.globalAlpha = 1;
+  for (const p of particles) {
+    if (p.type === 'text') {
+      ctx.globalAlpha = Math.max(p.life / p.maxLife, 0);
+      drawText(p.text, p.x, p.y, 16, p.color, 'center', 8);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawMiniShip(x, y) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(-Math.PI / 2);
+  ctx.scale(0.6, 0.6);
+  ctx.strokeStyle = '#5fffff'; ctx.lineWidth = 2;
+  shipPath(); ctx.stroke();
+  ctx.restore();
+}
+
+function drawGravIcon(x, y) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.strokeStyle = '#b78cff'; ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.arc(0, 0, 8, 0, TAU); ctx.stroke();
+  ctx.fillStyle = '#e0b3ff';
+  ctx.beginPath(); ctx.arc(0, 0, 2.4, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+function drawHUD() {
+  drawText('SCORE', 28, 30, 17, '#2e8f9a', 'left');
+  drawText(String(G.score).padStart(6, '0'), 28, 56, 26, '#5fffff', 'left');
+  const hi = Math.max(G.hiscores.length ? G.hiscores[0].score : 0, G.score);
+  drawText('HI-SCORE', W / 2, 30, 17, '#2e8f9a', 'center');
+  drawText(String(hi).padStart(6, '0'), W / 2, 56, 26, '#ffd166', 'center');
+  drawText('WAVE ' + Math.max(G.wave, 1), W - 28, 30, 17, '#2e8f9a', 'right');
+  // 剩余生命（不含当前飞船）
+  const spare = ship.alive ? G.lives - 1 : G.lives;
+  for (let i = 0; i < spare; i++) drawMiniShip(36 + i * 26, 88);
+  // 引力井充能
+  drawText('GRAV', W - 28, 56, 13, '#8a5fbf', 'right');
+  for (let i = 0; i < G.gravCharges; i++) drawGravIcon(W - 36 - i * 24, 78);
+  drawText('E: GRAVITY WELL    P: PAUSE    M: MUTE', W / 2, H - 16, 13, '#1f6b75', 'center', 0);
+}
+
+function drawTitle() {
+  drawText('A S T E R O I D S', W / 2, 165, 72, '#5fffff');
+  drawText('C R T   E D I T I O N', W / 2, 222, 20, '#c77dff');
+  if (Math.floor(G.time * 2) % 2 === 0)
+    drawText('PRESS ENTER', W / 2, 322, 26, '#e8ffff');
+  const lines = [
+    'LEFT / RIGHT ... ROTATE',
+    'UP ........... THRUST',
+    'SPACE ........ FIRE',
+    'E / SHIFT .... GRAVITY WELL',
+    'P: PAUSE    M: MUTE'
+  ];
+  for (let i = 0; i < lines.length; i++)
+    drawText(lines[i], W / 2, 396 + i * 26, 16, '#2e8f9a', 'center', 6);
+  drawText('HIGH SCORES', W / 2, 556, 20, '#ffd166');
+  const n = Math.min(5, G.hiscores.length);
+  for (let i = 0; i < n; i++)
+    drawText((i + 1) + '. ' + G.hiscores[i].name + '  ' + String(G.hiscores[i].score).padStart(6, '0'),
+      W / 2, 590 + i * 26, 17, '#8fd8d8', 'center', 6);
+  drawText('CRT SHADER · GRAVITY WELLS · 6-STAGE ASTEROIDS', W / 2, H - 22, 13, '#1f6b75', 'center', 0);
+}
+
+function drawGameOver() {
+  drawText('GAME OVER', W / 2, 150, 64, '#ff5f6f');
+  drawText('SCORE  ' + String(G.score).padStart(6, '0'), W / 2, 218, 26, '#e8ffff');
+  drawText('HIGH SCORES', W / 2, 280, 20, '#ffd166');
+  const n = Math.min(10, G.hiscores.length);
+  for (let i = 0; i < n; i++) {
+    const color = i === G.newHigh ? '#ffd166' : '#8fd8d8';
+    drawText((i + 1) + '. ' + G.hiscores[i].name + '  ' + String(G.hiscores[i].score).padStart(6, '0'),
+      W / 2, 314 + i * 26, 17, color, 'center', 6);
+  }
+  if (Math.floor(G.time * 2) % 2 === 0)
+    drawText('PRESS ENTER', W / 2, 314 + n * 26 + 34, 22, '#e8ffff');
+}
+
+function drawInitials() {
+  drawText('NEW HIGH SCORE!', W / 2, 250, 44, '#ffd166');
+  drawText('ENTER YOUR INITIALS', W / 2, 310, 20, '#e8ffff');
+  for (let i = 0; i < 3; i++) {
+    const x = W / 2 + (i - 1) * 56;
+    if (i === G.initPos && Math.floor(G.time * 4) % 2 === 0) {
+      ctx.fillStyle = 'rgba(95,255,255,0.15)';
+      ctx.fillRect(x - 22, 368, 44, 56);
+    }
+    drawText(G.initials[i], x, 398, 44, i === G.initPos ? '#5fffff' : '#e8ffff');
+  }
+  drawText('UP/DOWN: CHANGE   LEFT/RIGHT: MOVE   ENTER: OK', W / 2, 480, 15, '#2e8f9a', 'center', 6);
+}
+
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+  // 屏幕震动
+  if (G.shake > 0)
+    ctx.setTransform(1, 0, 0, 1, (Math.random() - 0.5) * G.shake, (Math.random() - 0.5) * G.shake);
+
+  drawStars();
+  for (const w of wells) drawWell(w);
+  for (const p of powerups) drawPowerup(p);
+  for (const a of asteroids) drawAsteroid(a);
+  if (ship.alive && !(ship.invuln > 0 && Math.floor(G.time * 12) % 2 === 0)) drawShip();
+  drawBullets();
+  drawParticles();
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  // 引爆闪光
+  if (G.flash > 0) {
+    ctx.globalAlpha = Math.min(G.flash * 1.6, 0.85);
+    ctx.fillStyle = '#c9a6ff';
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+  }
+
+  if (G.state === 'playing') drawHUD();
+  else if (G.state === 'title') drawTitle();
+  else if (G.state === 'gameover') drawGameOver();
+  else if (G.state === 'initials') drawInitials();
+
+  if (G.paused) drawText('PAUSED', W / 2, H / 2, 48, '#ffd166');
+  if (G.banner && G.banner.t > 0) {
+    ctx.globalAlpha = clamp(G.banner.t, 0, 1);
+    drawText(G.banner.text, W / 2, H / 2 - 60, 44, '#e8ffff');
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* ---------------- CRT 着色器（WebGL） ---------------- */
+const VERT_SRC = `
+attribute vec2 aPos;
+varying vec2 vUV;
+void main(){ vUV = aPos*0.5+0.5; gl_Position = vec4(aPos,0.0,1.0); }`;
+
+const FRAG_SRC = `
+precision highp float;
+varying vec2 vUV;
+uniform sampler2D uTex;
+uniform vec2 uRes;
+uniform float uTime;
+
+/* 屏幕曲率（桶形畸变） */
+vec2 curve(vec2 uv){
+  uv = uv*2.0-1.0;
+  vec2 off = abs(uv.yx)/vec2(5.5,4.5);
+  uv = uv + uv*off*off;
+  return uv*0.5+0.5;
+}
+
+float rand(vec2 co){ return fract(sin(dot(co, vec2(12.9898,78.233)))*43758.5453); }
+
+void main(){
+  vec2 uv = curve(vUV);
+  vec3 col = vec3(0.0);
+  if (uv.x>=0.0 && uv.x<=1.0 && uv.y>=0.0 && uv.y<=1.0){
+    /* 色散（边缘彩边） */
+    vec2 ca = (uv-0.5)*0.004;
+    col.r = texture2D(uTex, uv+ca).r;
+    col.g = texture2D(uTex, uv).g;
+    col.b = texture2D(uTex, uv-ca).b;
+    /* 荧光辉光（四邻域 bloom） */
+    vec2 px = 1.5/uRes;
+    vec3 bl = texture2D(uTex, uv+vec2(px.x,0.)).rgb + texture2D(uTex, uv-vec2(px.x,0.)).rgb
+            + texture2D(uTex, uv+vec2(0.,px.y)).rgb + texture2D(uTex, uv-vec2(0.,px.y)).rgb;
+    col += bl*0.10;
+    /* 扫描线 */
+    col *= 0.82 + 0.18*sin(uv.y*uRes.y*3.14159265);
+    /* 荫罩（RGB 三色条纹） */
+    float slot = mod(gl_FragCoord.x, 3.0);
+    vec3 grille = vec3(0.0);
+    if (slot<1.0) grille.r=1.0; else if(slot<2.0) grille.g=1.0; else grille.b=1.0;
+    col *= mix(vec3(1.0), grille*1.35, 0.18);
+    /* 缓慢滚动的亮带 */
+    col *= 0.96 + 0.04*sin(uv.y*6.0 - uTime*1.2);
+    /* 闪烁 */
+    col *= 0.985 + 0.015*sin(uTime*127.0);
+    /* 噪点 */
+    col += (rand(uv+fract(uTime))-0.5)*0.025;
+    /* 暗角 */
+    float vig = uv.x*uv.y*(1.0-uv.x)*(1.0-uv.y)*16.0;
+    col *= 0.35 + 0.65*pow(clamp(vig,0.0,1.0), 0.28);
+  }
+  gl_FragColor = vec4(col,1.0);
+}`;
+
+let gl = null, glOK = false, glTex = null, uResLoc = null, uTimeLoc = null;
+
+function setupGL() {
+  try {
+    gl = crtCanvas.getContext('webgl', { alpha: false, antialias: false, depth: false, stencil: false });
+    if (!gl) return false;
+    const compile = (type, src) => {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); return null; }
+      return s;
+    };
+    const vs = compile(gl.VERTEX_SHADER, VERT_SRC);
+    const fs = compile(gl.FRAGMENT_SHADER, FRAG_SRC);
+    if (!vs || !fs) return false;
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return false;
+    gl.useProgram(prog);
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, 'aPos');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    glTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, glTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    uResLoc = gl.getUniformLocation(prog, 'uRes');
+    uTimeLoc = gl.getUniformLocation(prog, 'uTime');
+    gl.uniform1i(gl.getUniformLocation(prog, 'uTex'), 0);
+    return true;
+  } catch (e) { return false; }
+}
+
+function present() {
+  if (!glOK) return;
+  gl.viewport(0, 0, crtCanvas.width, crtCanvas.height);
+  gl.bindTexture(gl.TEXTURE_2D, glTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, gameCanvas);
+  gl.uniform2f(uResLoc, W, H);
+  gl.uniform1f(uTimeLoc, (performance.now() / 1000) % 3600);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+/* ---------------- 尺寸自适应 ---------------- */
+function resize() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H) * 0.96;
+  const cw = Math.max(320, Math.round(W * s)), ch = Math.round(H * s);
+  crtCanvas.style.width = cw + 'px';
+  crtCanvas.style.height = ch + 'px';
+  gameCanvas.style.width = cw + 'px';
+  gameCanvas.style.height = ch + 'px';
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  crtCanvas.width = Math.round(cw * dpr);
+  crtCanvas.height = Math.round(ch * dpr);
+}
+
+/* ---------------- 初始化与主循环 ---------------- */
+G.hiscores = loadScores();
+glOK = setupGL();
+if (glOK) {
+  gameCanvas.style.display = 'none';
+  crtCanvas.style.display = 'block';
+} else {
+  // 降级：直接显示 2D 画布 + CSS 扫描线
+  crtCanvas.style.display = 'none';
+  gameCanvas.style.display = 'block';
+  scanDiv.style.display = 'block';
+}
+for (let i = 0; i < 5; i++) spawnAmbientAsteroid();
+resize();
+window.addEventListener('resize', resize);
+
+let last = performance.now();
+requestAnimationFrame(function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  G.time += dt;
+  if (G.banner && G.banner.t > 0) G.banner.t -= dt;
+  if (G.flash > 0) G.flash = Math.max(0, G.flash - 2.2 * dt);
+  if (G.shake > 0) G.shake = Math.max(0, G.shake - 38 * dt);
+  if (!G.paused) {
+    updateParticles(dt);
+    if (G.state === 'playing') updatePlaying(dt);
+    else {
+      updateAsteroids(dt);
+      if (G.state === 'title' && asteroids.length < 5) spawnAmbientAsteroid();
+    }
+  }
+  render();
+  present();
+});
+</script>
+</body>
+</html>
